@@ -35,7 +35,7 @@ function renderApiEdl(edits, duration) {
   const kept = apiEdl.filter(x => String(x.action).toUpperCase() !== 'CUT').reduce((sum, x) => sum + Math.max(0, Number(x.end)-Number(x.start)), 0);
   if (summary) summary.textContent = `${apiEdl.length} decisions • keep ${uiFmt(kept)} • cut ${uiFmt(Math.max(0, duration-kept))}`;
   track.querySelectorAll('.clip').forEach(x => x.remove());
-  apiEdl.forEach((s, i) => {
+  apiEdl.forEach((s) => {
     const start = Math.max(0, Number(s.start) || 0);
     const end = Math.min(duration, Number(s.end) || start);
     if (end <= start) return;
@@ -48,7 +48,7 @@ function renderApiEdl(edits, duration) {
     track.appendChild(clip);
     const row = document.createElement('div');
     row.className = 'editRow';
-    row.innerHTML = `<div class="editTop"><b>${uiFmt(start)} → ${uiFmt(end)}</b><span class="${cut ? 'cutText' : 'keepText'}">${cut ? 'CUT' : 'KEEP'}</span></div><div class="editMeta">${String(s.reason || 'AI edit decision')} • confidence ${Math.round((Number(s.confidence) || .7) * 100)}%</div>`;
+    row.innerHTML = `<div class="editTop"><b>${uiFmt(start)} → ${uiFmt(end)}</b><span class="${cut ? 'cutText' : 'keepText'}">${cut ? 'CUT' : 'KEEP'}</span></div><div class="editMeta">${escapeHtml(String(s.reason || 'AI edit decision'))} • confidence ${Math.round((Number(s.confidence) || .7) * 100)}%</div>`;
     row.onclick = () => { const video = document.querySelector('#video'); if (video && Number.isFinite(video.duration)) video.currentTime = start; uiToast(`${cut ? 'Cut' : 'Keep'} segment at ${uiFmt(start)}`); };
     box.appendChild(row);
   });
@@ -58,8 +58,34 @@ function renderTranscriptPanel(transcript) {
   const panel = document.querySelector('#toolPanel');
   if (!panel) return;
   const text = typeof transcript === 'string' ? transcript : (transcript?.text || '');
+  window.__lastTranscript = transcript;
   panel.classList.remove('hidden');
   panel.innerHTML = `<h3>Transcript</h3><div class="panelText" style="max-height:260px;overflow:auto;white-space:pre-wrap">${escapeHtml(text || 'No speech detected.')}</div>`;
+}
+function renderClipCandidates(clips, duration) {
+  const panel = document.querySelector('#toolPanel');
+  if (!panel) return;
+  const valid = Array.isArray(clips) ? clips.filter(c => Number(c.end) > Number(c.start)) : [];
+  if (!valid.length) return;
+  const rows = valid.map((c, i) => {
+    const start = Math.max(0, Number(c.start) || 0);
+    const end = Math.min(duration, Number(c.end) || start);
+    const length = Math.max(0, end - start);
+    return `<div class="editRow clipCandidate" data-start="${start}"><div class="editTop"><b>Clip ${i + 1} • ${uiFmt(length)}</b><span class="keepText">${Math.round((Number(c.confidence) || .6) * 100)}%</span></div><div class="editMeta">${escapeHtml(String(c.title || 'Short-form candidate'))}<br>${escapeHtml(String(c.reason || 'Strong standalone section'))}</div></div>`;
+  }).join('');
+  panel.classList.remove('hidden');
+  panel.innerHTML = `<h3>30–60 sec clip ideas</h3><div class="panelText" style="margin-bottom:8px">AI-picked sections from the original video. Click one to jump to that section.</div>${rows}`;
+  panel.querySelectorAll('.clipCandidate').forEach(row => {
+    row.onclick = () => {
+      const video = document.querySelector('#video');
+      const start = Number(row.dataset.start || 0);
+      if (video && Number.isFinite(video.duration)) {
+        video.currentTime = start;
+        video.play().catch(() => {});
+      }
+      uiToast(`Previewing clip from ${uiFmt(start)}`);
+    };
+  });
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
@@ -81,7 +107,7 @@ async function runRealAnalysis() {
   const analyze = document.querySelector('#analyze');
   const status = document.querySelector('#statusText');
   if (analyze) { analyze.disabled = true; analyze.textContent = 'Analyzing...'; }
-  if (status) status.textContent = 'Uploading video • transcribing speech • building edit plan...';
+  if (status) status.textContent = 'Uploading video • transcribing speech • finding 30–60 sec clips...';
   try {
     const health = await checkBackend();
     if (!health) throw new Error(`Backend unavailable at ${API_BASE}`);
@@ -105,10 +131,11 @@ async function runRealAnalysis() {
     document.querySelector('#recommendations')?.classList.remove('hidden');
     const modelStatus = document.querySelector('#modelStatus');
     if (modelStatus) modelStatus.innerHTML = `AI engine: ${escapeHtml(data.engine || 'backend')}<br>${data.transcript ? 'Transcript + edit analysis ready.' : 'Edit analysis ready. Add an API key on the backend for transcription.'}`;
-    if (status) status.textContent = 'Real backend analysis complete • Edit Decision List ready';
+    if (status) status.textContent = 'AI analysis complete • 30–60 sec clip candidates ready';
     renderTranscriptPanel(data.transcript);
+    renderClipCandidates(data.clips, duration);
     document.querySelector('#export').disabled = false;
-    uiToast('Real AI analysis complete');
+    uiToast(`${Array.isArray(data.clips) ? data.clips.length : 0} clip candidates found`);
   } catch (error) {
     if (status) status.textContent = 'Backend connection needed for real AI analysis';
     uiToast(error.message || 'Backend analysis failed');
@@ -133,4 +160,5 @@ function installBackendBridge() {
     uiToast('Edit plan applied');
   };
 }
-window.addEventListener('DOMContentLoaded', installBackendBridge);
+if (document.readyState === 'loading') window.addEventListener('DOMContentLoaded', installBackendBridge);
+else installBackendBridge();
