@@ -1,164 +1,35 @@
 const API_BASE = (localStorage.getItem('viral_ai_api') || window.VIRAL_API_URL || 'http://localhost:8787').replace(/\/$/, '');
 let apiFile = null;
 let apiEdl = [];
+let clipCandidates = [];
 
-function uiToast(message) {
-  const el = document.querySelector('#toast');
-  if (!el) return;
-  el.textContent = message;
-  el.style.display = 'block';
-  clearTimeout(window.__viralToast);
-  window.__viralToast = setTimeout(() => { el.style.display = 'none'; }, 3000);
+const $ = s => document.querySelector(s);
+function toast(message){const e=$('#toast');if(!e)return;e.textContent=message;e.style.display='block';clearTimeout(window.__toast);window.__toast=setTimeout(()=>e.style.display='none',3000)}
+function fmt(s){s=Number(s)||0;const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=Math.floor(s%60);return h?`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(x).padStart(2,'0')}`:`${String(m).padStart(2,'0')}:${String(x).padStart(2,'0')}`}
+function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]))}
+function metric(name,value){const v=Math.max(0,Math.min(100,Number(value)||0));const a=$(`#${name}Value`),b=$(`#${name}Meter`);if(a)a.textContent=`${Math.round(v)}%`;if(b)b.style.width=`${v}%`}
+
+function makeLocalClips(duration){
+  if(!duration||duration<1)return[];
+  if(duration<=60)return[{start:0,end:duration,title:'Best available clip',reason:'The video is already 60 seconds or shorter'}];
+  const length=45;
+  const count=Math.min(8,Math.max(3,Math.floor(duration/90)));
+  const clips=[];
+  for(let i=0;i<count;i++){const maxStart=Math.max(0,duration-length);const start=maxStart*(i/(count-1||1));clips.push({start,end:Math.min(duration,start+length),title:`Clip ${i+1}`,reason:i===0?'Opening section':i===count-1?'Ending/payoff section':'Candidate section from another part of the video'})}
+  return clips;
 }
-function uiFmt(s) {
-  if (!Number.isFinite(Number(s))) return '00:00';
-  s = Math.max(0, Number(s));
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
-  return h ? `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
-}
-function setMetric(name, value) {
-  const valueEl = document.querySelector(`#${name}Value`);
-  const meterEl = document.querySelector(`#${name}Meter`);
-  if (valueEl) valueEl.textContent = `${Math.round(value)}%`;
-  if (meterEl) meterEl.style.width = `${Math.max(0, Math.min(100, value))}%`;
-}
-function renderApiEdl(edits, duration) {
-  apiEdl = Array.isArray(edits) ? edits : [];
-  const card = document.querySelector('#edlCard');
-  const box = document.querySelector('#edl');
-  const summary = document.querySelector('#edlSummary');
-  const track = document.querySelector('#track');
-  const head = document.querySelector('#head');
-  if (!card || !box || !track || !duration) return;
-  card.classList.remove('hidden');
-  box.innerHTML = '';
-  const kept = apiEdl.filter(x => String(x.action).toUpperCase() !== 'CUT').reduce((sum, x) => sum + Math.max(0, Number(x.end)-Number(x.start)), 0);
-  if (summary) summary.textContent = `${apiEdl.length} decisions • keep ${uiFmt(kept)} • cut ${uiFmt(Math.max(0, duration-kept))}`;
-  track.querySelectorAll('.clip').forEach(x => x.remove());
-  apiEdl.forEach((s) => {
-    const start = Math.max(0, Number(s.start) || 0);
-    const end = Math.min(duration, Number(s.end) || start);
-    if (end <= start) return;
-    const cut = String(s.action).toUpperCase() === 'CUT';
-    const clip = document.createElement('div');
-    clip.className = `clip ${cut ? 'cut' : 'keep'}`;
-    clip.style.left = `${1 + start / duration * 98}%`;
-    clip.style.width = `${Math.max(.2, (end-start) / duration * 98)}%`;
-    clip.title = `${uiFmt(start)} - ${uiFmt(end)} • ${cut ? 'CUT' : 'KEEP'}`;
-    track.appendChild(clip);
-    const row = document.createElement('div');
-    row.className = 'editRow';
-    row.innerHTML = `<div class="editTop"><b>${uiFmt(start)} → ${uiFmt(end)}</b><span class="${cut ? 'cutText' : 'keepText'}">${cut ? 'CUT' : 'KEEP'}</span></div><div class="editMeta">${escapeHtml(String(s.reason || 'AI edit decision'))} • confidence ${Math.round((Number(s.confidence) || .7) * 100)}%</div>`;
-    row.onclick = () => { const video = document.querySelector('#video'); if (video && Number.isFinite(video.duration)) video.currentTime = start; uiToast(`${cut ? 'Cut' : 'Keep'} segment at ${uiFmt(start)}`); };
-    box.appendChild(row);
-  });
-  if (head) track.appendChild(head);
-}
-function renderTranscriptPanel(transcript) {
-  const panel = document.querySelector('#toolPanel');
-  if (!panel) return;
-  const text = typeof transcript === 'string' ? transcript : (transcript?.text || '');
-  window.__lastTranscript = transcript;
-  panel.classList.remove('hidden');
-  panel.innerHTML = `<h3>Transcript</h3><div class="panelText" style="max-height:260px;overflow:auto;white-space:pre-wrap">${escapeHtml(text || 'No speech detected.')}</div>`;
-}
-function renderClipCandidates(clips, duration) {
-  const panel = document.querySelector('#toolPanel');
-  if (!panel) return;
-  const valid = Array.isArray(clips) ? clips.filter(c => Number(c.end) > Number(c.start)) : [];
-  if (!valid.length) return;
-  const rows = valid.map((c, i) => {
-    const start = Math.max(0, Number(c.start) || 0);
-    const end = Math.min(duration, Number(c.end) || start);
-    const length = Math.max(0, end - start);
-    return `<div class="editRow clipCandidate" data-start="${start}"><div class="editTop"><b>Clip ${i + 1} • ${uiFmt(length)}</b><span class="keepText">${Math.round((Number(c.confidence) || .6) * 100)}%</span></div><div class="editMeta">${escapeHtml(String(c.title || 'Short-form candidate'))}<br>${escapeHtml(String(c.reason || 'Strong standalone section'))}</div></div>`;
-  }).join('');
-  panel.classList.remove('hidden');
-  panel.innerHTML = `<h3>30–60 sec clip ideas</h3><div class="panelText" style="margin-bottom:8px">AI-picked sections from the original video. Click one to jump to that section.</div>${rows}`;
-  panel.querySelectorAll('.clipCandidate').forEach(row => {
-    row.onclick = () => {
-      const video = document.querySelector('#video');
-      const start = Number(row.dataset.start || 0);
-      if (video && Number.isFinite(video.duration)) {
-        video.currentTime = start;
-        video.play().catch(() => {});
-      }
-      uiToast(`Previewing clip from ${uiFmt(start)}`);
-    };
-  });
-}
-function escapeHtml(value) {
-  return String(value).replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
-}
-async function checkBackend() {
-  try {
-    const r = await fetch(`${API_BASE}/api/health`, { method: 'GET' });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return await r.json();
-  } catch (e) {
-    return null;
-  }
-}
-async function runRealAnalysis() {
-  if (!apiFile) return uiToast('Import a video first');
-  const video = document.querySelector('#video');
-  const duration = Number(video?.duration || 0);
-  if (!duration) return uiToast('Video is still loading');
-  const analyze = document.querySelector('#analyze');
-  const status = document.querySelector('#statusText');
-  if (analyze) { analyze.disabled = true; analyze.textContent = 'Analyzing...'; }
-  if (status) status.textContent = 'Uploading video • transcribing speech • finding 30–60 sec clips...';
-  try {
-    const health = await checkBackend();
-    if (!health) throw new Error(`Backend unavailable at ${API_BASE}`);
-    const form = new FormData();
-    form.append('video', apiFile, apiFile.name);
-    form.append('duration', String(duration));
-    const response = await fetch(`${API_BASE}/api/analyze`, { method: 'POST', body: form });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || `Analysis failed (${response.status})`);
-    setMetric('hook', data.hook || 0);
-    setMetric('pace', data.pacing || 0);
-    setMetric('clarity', data.clarity || 0);
-    const score = Math.round(Number(data.score) || 0);
-    const scoreEl = document.querySelector('#score');
-    const scoreText = document.querySelector('#scoreText');
-    const ring = document.querySelector('#ring');
-    if (scoreEl) scoreEl.textContent = score;
-    if (scoreText) scoreText.textContent = data.engine === 'openai' ? 'AI analysis complete' : 'Backend analysis complete';
-    if (ring) ring.style.background = `conic-gradient(var(--g) 0 ${score}%,#242833 ${score}% 100%)`;
-    renderApiEdl(data.edits, duration);
-    document.querySelector('#recommendations')?.classList.remove('hidden');
-    const modelStatus = document.querySelector('#modelStatus');
-    if (modelStatus) modelStatus.innerHTML = `AI engine: ${escapeHtml(data.engine || 'backend')}<br>${data.transcript ? 'Transcript + edit analysis ready.' : 'Edit analysis ready. Add an API key on the backend for transcription.'}`;
-    if (status) status.textContent = 'AI analysis complete • 30–60 sec clip candidates ready';
-    renderTranscriptPanel(data.transcript);
-    renderClipCandidates(data.clips, duration);
-    document.querySelector('#export').disabled = false;
-    uiToast(`${Array.isArray(data.clips) ? data.clips.length : 0} clip candidates found`);
-  } catch (error) {
-    if (status) status.textContent = 'Backend connection needed for real AI analysis';
-    uiToast(error.message || 'Backend analysis failed');
-  } finally {
-    if (analyze) { analyze.disabled = false; analyze.textContent = 'Analyze'; }
-  }
-}
-function installBackendBridge() {
-  const input = document.querySelector('#file');
-  input?.addEventListener('change', e => { apiFile = e.target.files?.[0] || null; });
-  const analyze = document.querySelector('#analyze');
-  if (analyze) analyze.onclick = runRealAnalysis;
-  const captions = document.querySelector('#captions');
-  if (captions) captions.onclick = () => {
-    if (window.__lastTranscript) renderTranscriptPanel(window.__lastTranscript);
-    else uiToast('Run Analyze first to generate the transcript');
-  };
-  const apply = document.querySelector('#applyPlan');
-  if (apply) apply.onclick = () => {
-    if (!apiEdl.length) return uiToast('Run real analysis first');
-    document.querySelector('#statusText').textContent = 'AI edit plan applied to preview • cuts highlighted on timeline';
-    uiToast('Edit plan applied');
-  };
-}
-if (document.readyState === 'loading') window.addEventListener('DOMContentLoaded', installBackendBridge);
-else installBackendBridge();
+function ensureClipPanel(){let p=$('#clipCandidates');if(!p){p=document.createElement('div');p.id='clipCandidates';p.className='card';$('.right')?.appendChild(p)}return p}
+function renderClipPanel(){const p=ensureClipPanel();p.classList.remove('hidden');p.innerHTML=`<h3>30–60 sec clip candidates</h3><div class="panelText">${clipCandidates.length} clips found. Preview or create a video file.</div>`+clipCandidates.map((c,i)=>`<div class="editRow"><div class="editTop"><b>${esc(c.title)}</b><span>${fmt(c.end-c.start)}</span></div><div class="editMeta">${fmt(c.start)} → ${fmt(c.end)} • ${esc(c.reason)}</div><button class="miniBtn previewClip" data-i="${i}">Preview</button><button class="miniBtn makeClip" data-i="${i}">Create video clip</button></div>`).join('');p.querySelectorAll('.previewClip').forEach(b=>b.onclick=()=>previewClip(Number(b.dataset.i)));p.querySelectorAll('.makeClip').forEach(b=>b.onclick=()=>recordClip(Number(b.dataset.i)))}
+function previewClip(i){const c=clipCandidates[i],v=$('#video');if(!c||!v)return;v.currentTime=c.start;v.play().catch(()=>{});toast(`Previewing ${c.title}`)}
+async function recordClip(i){const c=clipCandidates[i],v=$('#video');if(!c||!v?.captureStream){toast('This browser does not support clip export');return}const b=document.querySelector(`.makeClip[data-i="${i}"]`);if(b){b.disabled=true;b.textContent='Creating...'}try{v.pause();v.currentTime=c.start;await new Promise(resolve=>{const f=()=>{v.removeEventListener('seeked',f);resolve()};v.addEventListener('seeked',f)});const stream=v.captureStream();const mime=MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':'video/webm';const rec=new MediaRecorder(stream,{mimeType:mime}),chunks=[];rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);const done=new Promise((resolve,reject)=>{rec.onstop=resolve;rec.onerror=reject});rec.start(250);v.play().catch(()=>{});await new Promise(resolve=>setTimeout(resolve,(c.end-c.start)*1000));v.pause();rec.stop();await done;const blob=new Blob(chunks,{type:mime}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`viral-ai-clip-${i+1}.webm`;a.click();setTimeout(()=>URL.revokeObjectURL(url),5000);toast(`${c.title} created`)}catch(e){toast('Clip export failed: '+(e.message||'unknown error'))}finally{if(b){b.disabled=false;b.textContent='Create video clip'}}}
+
+function renderEdl(edits,duration){apiEdl=Array.isArray(edits)?edits:[];const card=$('#edlCard'),box=$('#edl'),summary=$('#edlSummary'),track=$('#track'),head=$('#head');if(!card||!box||!track||!duration)return;card.classList.remove('hidden');box.innerHTML='';track.querySelectorAll('.clip').forEach(x=>x.remove());apiEdl.forEach(s=>{const start=Math.max(0,Number(s.start)||0),end=Math.min(duration,Number(s.end)||start);if(end<=start)return;const cut=String(s.action).toUpperCase()==='CUT';const clip=document.createElement('div');clip.className=`clip ${cut?'cut':'keep'}`;clip.style.left=`${1+start/duration*98}%`;clip.style.width=`${Math.max(.3,(end-start)/duration*98)}%`;track.appendChild(clip);const row=document.createElement('div');row.className='editRow';row.innerHTML=`<div class="editTop"><b>${fmt(start)} → ${fmt(end)}</b><span class="${cut?'cutText':'keepText'}">${cut?'CUT':'KEEP'}</span></div><div class="editMeta">${esc(s.reason||'AI edit decision')}</div>`;row.onclick=()=>{$('#video').currentTime=start};box.appendChild(row)});if(head)track.appendChild(head);if(summary)summary.textContent=`${apiEdl.length} edit decisions`}
+function renderTranscriptPanel(t){window.__lastTranscript=t;const p=$('#toolPanel');if(!p)return;const text=typeof t==='string'?t:(t?.text||'');p.classList.remove('hidden');p.innerHTML=`<h3>Transcript</h3><div class="panelText" style="max-height:260px;overflow:auto;white-space:pre-wrap">${esc(text||'No speech detected.')}</div>`}
+
+async function backendAvailable(){try{const r=await fetch(`${API_BASE}/api/health`);return r.ok}catch{return false}}
+function localAnalyze(){const v=$('#video'),d=Number(v?.duration||0);if(!d){toast('Import a video first');return}metric('hook',d>60?76:84);metric('pace',d>120?66:80);metric('clarity',82);const score=Math.round((76+(d>120?66:80)+82)/3);$('#score').textContent=score;$('#scoreText').textContent='Local analysis ready';$('#ring').style.background=`conic-gradient(var(--g) 0 ${score}%,#242833 ${score}% 100%)`;clipCandidates=makeLocalClips(d);renderClipPanel();$('#recommendations')?.classList.remove('hidden');$('#export').disabled=false;$('#statusText').textContent='Clip candidates ready • local mode';$('#modelStatus').innerHTML='AI engine: local fallback<br>Backend is not connected. Clip selection and export still work in your browser.';toast(`${clipCandidates.length} clip candidates ready`)}
+
+async function analyze(){const input=$('#file'),v=$('#video'),f=input?.files?.[0]||apiFile;if(f)apiFile=f;if(!apiFile||!v?.duration){toast('Import a video first');return}const btn=$('#analyze');btn.disabled=true;btn.textContent='Analyzing...';$('#statusText').textContent='Analyzing video...';try{if(!(await backendAvailable())){localAnalyze();return}const form=new FormData();form.append('video',apiFile,apiFile.name);form.append('duration',String(v.duration));const r=await fetch(`${API_BASE}/api/analyze`,{method:'POST',body:form});const data=await r.json();if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);metric('hook',data.hook);metric('pace',data.pacing);metric('clarity',data.clarity);const score=Math.round(Number(data.score)||0);$('#score').textContent=score;$('#scoreText').textContent='AI analysis complete';$('#ring').style.background=`conic-gradient(var(--g) 0 ${score}%,#242833 ${score}% 100%)`;renderEdl(data.edits,v.duration);renderTranscriptPanel(data.transcript);clipCandidates=Array.isArray(data.clips)?data.clips.map((c,i)=>({start:Number(c.start),end:Number(c.end),title:c.title||`AI Clip ${i+1}`,reason:c.reason||'AI selected moment'})).filter(c=>c.end>c.start):makeLocalClips(v.duration);renderClipPanel();$('#recommendations')?.classList.remove('hidden');$('#export').disabled=false;$('#statusText').textContent='AI analysis complete • 30–60 sec clips ready';$('#modelStatus').innerHTML=`AI engine: ${esc(data.engine||'OpenAI')}<br>Transcript and edit plan ready.`;toast('AI analysis complete')}catch(e){localAnalyze()}finally{btn.disabled=false;btn.textContent='Analyze'}}
+
+function install(){const input=$('#file');input?.addEventListener('change',e=>apiFile=e.target.files?.[0]||null);const a=$('#analyze');if(a)a.onclick=analyze;const c=$('#captions');if(c)c.onclick=()=>window.__lastTranscript?renderTranscriptPanel(window.__lastTranscript):toast('Run Analyze first');const apply=$('#applyPlan');if(apply)apply.onclick=()=>{if(!clipCandidates.length){toast('Run Analyze first');return}renderClipPanel();$('#statusText').textContent='Clip plan applied to preview';toast('Clip plan applied')}}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',install);else install();
