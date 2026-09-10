@@ -17,7 +17,7 @@ fs.mkdirSync(uploads, { recursive: true });
 const app = express();
 const upload = multer({ dest: uploads, limits: { fileSize: 500 * 1024 * 1024 } });
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "4mb" }));
 if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 const client = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 
@@ -43,29 +43,89 @@ function localAnalysis({ duration = 0, filename = "media" }) {
       "Emphasize important words in captions",
       "Add a visual change when attention drops"
     ],
-    engine: client ? "ai-ready-local-fallback" : "local-fallback"
+    engine: client ? "backend-fallback" : "local-fallback"
   };
+}
+
+function extractAudio(input, output) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(input)
+      .noVideo()
+      .audioCodec("pcm_s16le")
+      .audioChannels(1)
+      .audioFrequency(16000)
+      .format("wav")
+      .on("end", resolve)
+      .on("error", reject)
+      .save(output);
+  });
+}
+
+function normalizeWords(transcription) {
+  if (!Array.isArray(transcription?.words)) return [];
+  return transcription.words.map(w => ({
+    word: String(w.word || "").trim(),
+    start: Number(w.start || 0),
+    end: Number(w.end || 0)
+  })).filter(w => w.word && w.end >= w.start);
+}
+
+function parseJson(text) {
+  try { return JSON.parse(text); } catch {}
+  const match = String(text || "").match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try { return JSON.parse(match[0]); } catch { return null; }
+}
+
+async function aiEditAnalysis({ transcriptText, words, duration }) {
+  if (!client) return null;
+  const compactWords = words.slice(0, 12000);
+  const prompt = `You are the editing brain for a short-form video editor. Analyze the supplied transcript and word timestamps. Return ONLY valid JSON. Do not invent quotes or timestamps outside the supplied range. The goal is to improve retention without copying any other creator.\n\nReturn this shape:\n{"score":0,"hook":0,"pacing":0,"clarity":0,"recommendations":["..."],"edits":[{"start":0,"end":2,"action":"KEEP","reason":"...","confidence":0.9}],"keyMoments":[{"start":0,"end":2,"reason":"..."}]}\n\nRules: score/hook/pacing/clarity are 0-100. Every edit must have start/end within 0-${duration.toFixed(2)}. Prefer KEEP segments around strong hooks, useful information, emotional moments, or clear payoffs. Use CUT for obvious dead air, repeated setup, filler, or low-value sections. Do not mark the entire video CUT. Keep the number of edit decisions practical, usually 8-40 for a long video.\n\nTranscript:\n${transcriptText}\n\nWord timestamps:\n${JSON.stringify(compactWords)}`;
+  const response = await client.responses.create({
+    model: process.env.ANALYSIS_MODEL || "gpt-5.6-luna",
+    input: prompt,
+    reasoning: { effort: "low" }
+  });
+  return parseJson(response.output_text);
 }
 
 app.post("/api/analyze", upload.single("video"), async (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).json({ error: "No video uploaded" });
   const duration = Number(req.body.duration || 0);
-  const result = localAnalysis({ duration, filename: file.originalname });
+  const base = localAnalysis({ duration, filename: file.originalname });
+  const audioPath = path.join(uploads, `${file.filename}.wav`);
   try {
-    if (client && file.mimetype.startsWith("audio/")) {
-      result.transcript = await client.audio.transcriptions.create({
-        file: fs.createReadStream(file.path),
-        model: "gpt-4o-mini-transcribe",
-        response_format: "verbose_json"
-      });
+    if (!client) return res.json(base);
+    await extractAudio(file.path, audioPath);
+    const transcription = await client.audio.transcriptions.create({
+      file: fs.createReadStream(audioPath),
+      model: process.env.TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe",
+      response_format: "verbose_json",
+      timestamp_granularities: ["word", "segment"]
+    });
+    const words = normalizeWords(transcription);
+    const transcriptText = String(transcription.text || "");
+    const ai = await aiEditAnalysis({ transcriptText, words, duration });
+    if (ai) {
+      base.score = Number(ai.score) || base.score;
+      base.hook = Number(ai.hook) || base.hook;
+      base.pacing = Number(ai.pacing) || base.pacing;
+      base.clarity = Number(ai.clarity) || base.clarity;
+      base.edits = Array.isArray(ai.edits) ? ai.edits : base.edits;
+      base.recommendations = Array.isArray(ai.recommendations) ? ai.recommendations : base.recommendations;
+      base.keyMoments = Array.isArray(ai.keyMoments) ? ai.keyMoments : [];
     }
-  } catch (_error) {
-    result.transcriptionError = "Transcription failed, local edit analysis is still available.";
+    base.transcript = { text: transcriptText, words };
+    base.engine = "openai";
+    res.json(base);
+  } catch (error) {
+    base.transcriptionError = error?.message || "AI analysis failed";
+    res.json(base);
   } finally {
     fs.rm(file.path, { force: true }, () => {});
+    fs.rm(audioPath, { force: true }, () => {});
   }
-  res.json(result);
 });
 
 app.post("/api/edl", (req, res) => {
@@ -76,7 +136,7 @@ app.post("/api/edl", (req, res) => {
     const previous = words[i - 1];
     const current = words[i];
     if (Number(current.start) - Number(previous.end) >= 0.65) {
-      pauses.push({ start: Number(previous.end), end: Number(current.start), action: "CUT", reason: "Long pause" });
+      pauses.push({ start: Number(previous.end), end: Number(current.start), action: "CUT", reason: "Long pause", confidence: 0.86 });
     }
   }
   res.json({ duration, edits: pauses, message: pauses.length ? "Pause cuts generated" : "No long pauses detected" });
