@@ -23,6 +23,27 @@ const client = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPE
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, aiConfigured: Boolean(client), ffmpegConfigured: Boolean(ffmpegPath) }));
 
+function buildLocalClips(duration) {
+  const clips = [];
+  if (!duration) return clips;
+  if (duration <= 60) {
+    clips.push({ start: 0, end: duration, title: "Full short-form clip", reason: "Source is already under 60 seconds", confidence: 0.95 });
+    return clips;
+  }
+  const target = duration >= 180 ? 45 : 40;
+  let start = 0;
+  let index = 1;
+  while (start < duration && clips.length < 8) {
+    const end = Math.min(duration, start + target);
+    if (end - start >= 30 || clips.length === 0) {
+      clips.push({ start, end, title: `Clip ${index}`, reason: "Short-form candidate window", confidence: 0.65 });
+    }
+    start = end;
+    index++;
+  }
+  return clips;
+}
+
 function localAnalysis({ duration = 0, filename = "media" }) {
   const longVideo = duration > 120;
   const hook = longVideo ? 72 : 82;
@@ -32,6 +53,7 @@ function localAnalysis({ duration = 0, filename = "media" }) {
     filename, duration,
     score: Math.round((hook + pacing + clarity) / 3), hook, pacing, clarity,
     transcript: null,
+    clips: buildLocalClips(duration),
     edits: [
       { start: 0, end: Math.min(2.5, duration || 2.5), action: "KEEP", reason: "Opening hook zone", confidence: 0.72 },
       { start: Math.min(2.5, duration || 2.5), end: Math.min(5, duration || 5), action: "REVIEW", reason: "Check whether the setup can be shortened", confidence: 0.61 },
@@ -70,6 +92,21 @@ function normalizeWords(transcription) {
   })).filter(w => w.word && w.end >= w.start);
 }
 
+function normalizeClips(clips, duration) {
+  if (!Array.isArray(clips)) return [];
+  return clips.map((clip, i) => {
+    const start = Math.max(0, Number(clip.start) || 0);
+    const end = Math.min(duration, Number(clip.end) || 0);
+    return {
+      start,
+      end,
+      title: String(clip.title || `Clip ${i + 1}`).slice(0, 80),
+      reason: String(clip.reason || "Short-form candidate").slice(0, 180),
+      confidence: Math.max(0, Math.min(1, Number(clip.confidence) || 0.6))
+    };
+  }).filter(c => c.end > c.start && c.end - c.start >= 30 && c.end - c.start <= 60).slice(0, 8);
+}
+
 function parseJson(text) {
   try { return JSON.parse(text); } catch {}
   const match = String(text || "").match(/\{[\s\S]*\}/);
@@ -80,7 +117,7 @@ function parseJson(text) {
 async function aiEditAnalysis({ transcriptText, words, duration }) {
   if (!client) return null;
   const compactWords = words.slice(0, 12000);
-  const prompt = `You are the editing brain for a short-form video editor. Analyze the supplied transcript and word timestamps. Return ONLY valid JSON. Do not invent quotes or timestamps outside the supplied range. The goal is to improve retention without copying any other creator.\n\nReturn this shape:\n{"score":0,"hook":0,"pacing":0,"clarity":0,"recommendations":["..."],"edits":[{"start":0,"end":2,"action":"KEEP","reason":"...","confidence":0.9}],"keyMoments":[{"start":0,"end":2,"reason":"..."}]}\n\nRules: score/hook/pacing/clarity are 0-100. Every edit must have start/end within 0-${duration.toFixed(2)}. Prefer KEEP segments around strong hooks, useful information, emotional moments, or clear payoffs. Use CUT for obvious dead air, repeated setup, filler, or low-value sections. Do not mark the entire video CUT. Keep the number of edit decisions practical, usually 8-40 for a long video.\n\nTranscript:\n${transcriptText}\n\nWord timestamps:\n${JSON.stringify(compactWords)}`;
+  const prompt = `You are the editing brain for a short-form video editor. Analyze the supplied transcript and word timestamps. Return ONLY valid JSON. Do not invent quotes or timestamps outside the supplied range. The goal is to improve retention without copying any other creator.\n\nReturn this shape:\n{"score":0,"hook":0,"pacing":0,"clarity":0,"recommendations":["..."],"edits":[{"start":0,"end":2,"action":"KEEP","reason":"...","confidence":0.9}],"keyMoments":[{"start":0,"end":2,"reason":"..."}],"clips":[{"start":0,"end":45,"title":"...","reason":"Why this 30-60 second section works as a standalone short","confidence":0.9}]}\n\nRules: score/hook/pacing/clarity are 0-100. Every edit must have start/end within 0-${duration.toFixed(2)}. Prefer KEEP segments around strong hooks, useful information, emotional moments, or clear payoffs. Use CUT for obvious dead air, repeated setup, filler, or low-value sections. Do not mark the entire video CUT. Keep the number of edit decisions practical, usually 8-40 for a long video.\n\nClip rules: If the source is longer than 60 seconds, return 3-8 strong standalone clip candidates. EVERY clip must be between 30 and 60 seconds long. Pick sections with a clear hook, useful or entertaining content, and a satisfying payoff. Avoid starting a clip in the middle of a sentence. Prefer clean boundaries near natural pauses. Clips may overlap when they represent different strong moments. If the source is 60 seconds or shorter, return one clip covering the useful source.\n\nTranscript:\n${transcriptText}\n\nWord timestamps:\n${JSON.stringify(compactWords)}`;
   const response = await client.responses.create({
     model: process.env.ANALYSIS_MODEL || "gpt-5.6-luna",
     input: prompt,
@@ -115,6 +152,8 @@ app.post("/api/analyze", upload.single("video"), async (req, res) => {
       base.edits = Array.isArray(ai.edits) ? ai.edits : base.edits;
       base.recommendations = Array.isArray(ai.recommendations) ? ai.recommendations : base.recommendations;
       base.keyMoments = Array.isArray(ai.keyMoments) ? ai.keyMoments : [];
+      const aiClips = normalizeClips(ai.clips, duration);
+      if (aiClips.length) base.clips = aiClips;
     }
     base.transcript = { text: transcriptText, words };
     base.engine = "openai";
