@@ -17,13 +17,7 @@ jobs:
         shell: bash
         run: |
           if ! grep -q 'client.js' index.html; then
-            python - <<'PY'
-            from pathlib import Path
-            p = Path('index.html')
-            s = p.read_text()
-            s = s.replace('</body>', '<script src="client.js"></script>\n</body>')
-            p.write_text(s)
-            PY
+            python -c "from pathlib import Path; p=Path('index.html'); s=p.read_text(); p.write_text(s.replace('</body>', '<script src=\"client.js\"></script>\\n</body>'))"
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git add index.html
