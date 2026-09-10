@@ -65,5 +65,6 @@ $('#viral').onclick=()=>showPanel('Viral strategy','The strategy layer will late
 document.querySelectorAll('.format button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.format button').forEach(x=>x.classList.remove('selected'));b.classList.add('selected');selectedRatio=b.dataset.ratio;toast('Output format: '+selectedRatio)});
 exportBtn.onclick=()=>{if(!edl.length)return toast('Analyze the video first');toast('Render backend is next. The edit plan is ready.')};
 </script>
+<script src="client.js"></script>
 </body>
 </html>
